@@ -176,6 +176,51 @@ function TopicFrequencyPanel({ context }: { context: PanelExtensionContext }): R
     }));
   }, []);
 
+  const exportToCSV = useCallback(() => {
+    if (frequencyStats.length === 0) {
+      return;
+    }
+
+    const headers = [
+      "Topic",
+      "Message Count",
+      "Average Frequency (Hz)",
+      "Median Frequency (Hz)",
+      "Standard Deviation (Hz)",
+      "Min Frequency (Hz)",
+      "Max Frequency (Hz)",
+      "Total Samples",
+      "Filtered Samples",
+      "Outlier Count"
+    ];
+
+    const csvContent = [
+      headers.join(","),
+      ...frequencyStats.map(stats => [
+        `"${stats.topic}"`,
+        stats.messageCount,
+        stats.averageFrequency.toFixed(4),
+        stats.medianFrequency.toFixed(4),
+        stats.stdDeviation.toFixed(4),
+        stats.minFrequency.toFixed(4),
+        stats.maxFrequency.toFixed(4),
+        stats.frequencies.length,
+        stats.filteredFrequencies.length,
+        stats.outlierCount
+      ].join(","))
+    ].join("\n");
+
+    const blob = new Blob([csvContent], { type: "text/csv;charset=utf-8;" });
+    const link = document.createElement("a");
+    const url = URL.createObjectURL(blob);
+    link.setAttribute("href", url);
+    link.setAttribute("download", `topic_frequency_analysis_${new Date().toISOString().slice(0, 19).replace(/:/g, "-")}.csv`);
+    link.style.visibility = "hidden";
+    document.body.appendChild(link);
+    link.click();
+    document.body.removeChild(link);
+  }, [frequencyStats]);
+
   useLayoutEffect(() => {
     context.onRender = (renderState, done) => {
       setRenderDone(() => done);
@@ -291,6 +336,21 @@ function TopicFrequencyPanel({ context }: { context: PanelExtensionContext }): R
           />
           Show Histogram
         </label>
+        <button
+          onClick={exportToCSV}
+          disabled={frequencyStats.length === 0}
+          style={{
+            padding: "0.5rem 1rem",
+            fontSize: "0.9rem",
+            border: "1px solid #007acc",
+            backgroundColor: frequencyStats.length > 0 ? "#007acc" : "#ccc",
+            color: "white",
+            borderRadius: "4px",
+            cursor: frequencyStats.length > 0 ? "pointer" : "not-allowed",
+          }}
+        >
+          Export CSV
+        </button>
       </div>
 
       <div style={{ marginBottom: "1rem" }}>
