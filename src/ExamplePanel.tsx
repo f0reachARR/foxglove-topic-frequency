@@ -1,5 +1,13 @@
 import { Immutable, PanelExtensionContext, Topic } from "@foxglove/extension";
-import { ReactElement, useCallback, useEffect, useLayoutEffect, useMemo, useState } from "react";
+import {
+  ReactElement,
+  useCallback,
+  useEffect,
+  useLayoutEffect,
+  useMemo,
+  useState,
+  useRef,
+} from "react";
 import { createRoot } from "react-dom/client";
 
 interface FrequencyStats {
@@ -19,6 +27,16 @@ interface TopicTimestamps {
   [topic: string]: Set<number>;
 }
 
+interface CachedStats {
+  [topic: string]: {
+    stats: FrequencyStats;
+    lastUpdate: number;
+    timestampCount: number;
+  };
+}
+
+const MAX_TIMESTAMPS_PER_TOPIC = 1000;
+
 interface HistogramBin {
   binStart: number;
   binEnd: number;
@@ -30,9 +48,11 @@ function TopicFrequencyPanel({ context }: { context: PanelExtensionContext }): R
   const [selectedTopics, setSelectedTopics] = useState<string[]>([]);
   const [topicTimestamps, setTopicTimestamps] = useState<TopicTimestamps>({});
   const [outlierThreshold, setOutlierThreshold] = useState<number>(2.0);
-  const [showHistogram, setShowHistogram] = useState<boolean>(true);
+  const [showHistogram, setShowHistogram] = useState<boolean>(false);
   const [sortBy, setSortBy] = useState<"topic" | "frequency" | "outliers">("topic");
   const [renderDone, setRenderDone] = useState<(() => void) | undefined>();
+  const [expandedTopics, setExpandedTopics] = useState<Set<string>>(new Set());
+  const statsCache = useRef<CachedStats>({});
 
   const removeOutliers = useCallback((frequencies: number[], threshold: number): number[] => {
     if (frequencies.length < 3) {
@@ -134,11 +154,35 @@ function TopicFrequencyPanel({ context }: { context: PanelExtensionContext }): R
     [removeOutliers, outlierThreshold],
   );
 
+  const getCachedStats = useCallback(
+    (topic: string): FrequencyStats => {
+      const timestamps = topicTimestamps[topic];
+      const timestampCount = timestamps?.size || 0;
+      const lastUpdate = timestamps ? Math.max(...Array.from(timestamps)) : 0;
+
+      const cached = statsCache.current[topic];
+      if (cached && cached.lastUpdate === lastUpdate && cached.timestampCount === timestampCount) {
+        return cached.stats;
+      }
+
+      const stats: FrequencyStats = {
+        topic,
+        ...calculateFrequencyStats(Array.from(timestamps || []).sort()),
+      };
+
+      statsCache.current[topic] = {
+        stats,
+        lastUpdate,
+        timestampCount,
+      };
+
+      return stats;
+    },
+    [topicTimestamps, calculateFrequencyStats],
+  );
+
   const frequencyStats = useMemo(() => {
-    const stats = selectedTopics.map((topic) => ({
-      topic,
-      ...calculateFrequencyStats(Array.from(topicTimestamps[topic] || []).sort()),
-    }));
+    const stats = selectedTopics.map(getCachedStats);
 
     return stats.sort((a, b) => {
       switch (sortBy) {
@@ -151,7 +195,7 @@ function TopicFrequencyPanel({ context }: { context: PanelExtensionContext }): R
           return a.topic.localeCompare(b.topic);
       }
     });
-  }, [selectedTopics, topicTimestamps, calculateFrequencyStats, sortBy]);
+  }, [selectedTopics, getCachedStats, sortBy]);
 
   const createHistogram = useCallback((frequencies: number[], bins = 20): HistogramBin[] => {
     if (frequencies.length === 0) {
@@ -191,30 +235,35 @@ function TopicFrequencyPanel({ context }: { context: PanelExtensionContext }): R
       "Max Frequency (Hz)",
       "Total Samples",
       "Filtered Samples",
-      "Outlier Count"
+      "Outlier Count",
     ];
 
     const csvContent = [
       headers.join(","),
-      ...frequencyStats.map(stats => [
-        `"${stats.topic}"`,
-        stats.messageCount,
-        stats.averageFrequency.toFixed(4),
-        stats.medianFrequency.toFixed(4),
-        stats.stdDeviation.toFixed(4),
-        stats.minFrequency.toFixed(4),
-        stats.maxFrequency.toFixed(4),
-        stats.frequencies.length,
-        stats.filteredFrequencies.length,
-        stats.outlierCount
-      ].join(","))
+      ...frequencyStats.map((stats) =>
+        [
+          `"${stats.topic}"`,
+          stats.messageCount,
+          stats.averageFrequency.toFixed(4),
+          stats.medianFrequency.toFixed(4),
+          stats.stdDeviation.toFixed(4),
+          stats.minFrequency.toFixed(4),
+          stats.maxFrequency.toFixed(4),
+          stats.frequencies.length,
+          stats.filteredFrequencies.length,
+          stats.outlierCount,
+        ].join(","),
+      ),
     ].join("\n");
 
     const blob = new Blob([csvContent], { type: "text/csv;charset=utf-8;" });
     const link = document.createElement("a");
     const url = URL.createObjectURL(blob);
     link.setAttribute("href", url);
-    link.setAttribute("download", `topic_frequency_analysis_${new Date().toISOString().slice(0, 19).replace(/:/g, "-")}.csv`);
+    link.setAttribute(
+      "download",
+      `topic_frequency_analysis_${new Date().toISOString().slice(0, 19).replace(/:/g, "-")}.csv`,
+    );
     link.style.visibility = "hidden";
     document.body.appendChild(link);
     link.click();
@@ -229,16 +278,31 @@ function TopicFrequencyPanel({ context }: { context: PanelExtensionContext }): R
       if (renderState.currentFrame) {
         setTopicTimestamps((prev) => {
           const updated = { ...prev };
+          let hasChanges = false;
 
           renderState.currentFrame?.forEach((messageEvent) => {
             const topic = messageEvent.topic;
             const timestamp = messageEvent.receiveTime.sec + messageEvent.receiveTime.nsec * 1e-9;
 
-            updated[topic] ??= new Set<number>();
+            if (!updated[topic]) {
+              updated[topic] = new Set<number>();
+            }
+
+            const prevSize = updated[topic].size;
             updated[topic].add(timestamp);
+
+            if (updated[topic].size > prevSize) {
+              hasChanges = true;
+
+              if (updated[topic].size > MAX_TIMESTAMPS_PER_TOPIC) {
+                const sortedTimestamps = Array.from(updated[topic]).sort((a, b) => b - a);
+                updated[topic] = new Set(sortedTimestamps.slice(0, MAX_TIMESTAMPS_PER_TOPIC));
+                delete statsCache.current[topic];
+              }
+            }
           });
 
-          return updated;
+          return hasChanges ? updated : prev;
         });
       }
     };
@@ -282,6 +346,18 @@ function TopicFrequencyPanel({ context }: { context: PanelExtensionContext }): R
 
   const handleDeselectAllTopics = useCallback(() => {
     setSelectedTopics([]);
+  }, []);
+
+  const toggleTopicExpanded = useCallback((topic: string) => {
+    setExpandedTopics((prev) => {
+      const newSet = new Set(prev);
+      if (newSet.has(topic)) {
+        newSet.delete(topic);
+      } else {
+        newSet.add(topic);
+      }
+      return newSet;
+    });
   }, []);
 
   return (
@@ -409,119 +485,145 @@ function TopicFrequencyPanel({ context }: { context: PanelExtensionContext }): R
         </div>
       </div>
 
-      {frequencyStats.map((stats) => (
-        <div
-          key={stats.topic}
-          style={{
-            marginBottom: "2rem",
-            border: "1px solid #ddd",
-            padding: "1rem",
-            borderRadius: "4px",
-          }}
-        >
-          <h3>{stats.topic}</h3>
-
+      {frequencyStats.map((stats) => {
+        const isExpanded = expandedTopics.has(stats.topic);
+        return (
           <div
+            key={stats.topic}
             style={{
-              display: "grid",
-              gridTemplateColumns: "repeat(3, 1fr)",
-              gap: "1rem",
               marginBottom: "1rem",
+              border: "1px solid #ddd",
+              borderRadius: "4px",
             }}
           >
-            <div>
-              <strong>Messages:</strong> {stats.messageCount}
-              <br />
-              <strong>Avg Freq:</strong> {stats.averageFrequency.toFixed(2)} Hz
-              <br />
-              <strong>Median Freq:</strong> {stats.medianFrequency.toFixed(2)} Hz
+            <div
+              style={{
+                padding: "0.75rem 1rem",
+                backgroundColor: "#f8f9fa",
+                borderBottom: isExpanded ? "1px solid #ddd" : "none",
+                cursor: "pointer",
+                display: "flex",
+                justifyContent: "space-between",
+                alignItems: "center",
+              }}
+              onClick={() => toggleTopicExpanded(stats.topic)}
+            >
+              <div>
+                <strong>{stats.topic}</strong>
+                <span style={{ marginLeft: "1rem", color: "#666", fontSize: "0.9em" }}>
+                  {stats.messageCount} msgs | {stats.averageFrequency.toFixed(1)} Hz avg
+                  {stats.outlierCount > 0 && ` | ${stats.outlierCount} outliers`}
+                </span>
+              </div>
+              <span style={{ fontSize: "1.2em", color: "#666" }}>{isExpanded ? "▼" : "▶"}</span>
             </div>
-            <div>
-              <strong>Std Dev:</strong> {stats.stdDeviation.toFixed(2)} Hz
-              <br />
-              <strong>Min Freq:</strong> {stats.minFrequency.toFixed(2)} Hz
-              <br />
-              <strong>Max Freq:</strong> {stats.maxFrequency.toFixed(2)} Hz
-            </div>
-            <div>
-              <strong>Total Samples:</strong> {stats.frequencies.length}
-              <br />
-              <strong>Filtered Samples:</strong> {stats.filteredFrequencies.length}
-              <br />
-              <strong>Outliers:</strong> {stats.outlierCount}
-            </div>
-          </div>
 
-          {showHistogram && stats.filteredFrequencies.length > 0 && (
-            <div>
-              <h4>Frequency Distribution (Outliers Removed)</h4>
-              <div
-                style={{
-                  display: "flex",
-                  alignItems: "end",
-                  height: "120px",
-                  gap: "2px",
-                  position: "relative",
-                }}
-              >
-                {createHistogram(stats.filteredFrequencies).map((bin, index) => {
-                  const histogramData = createHistogram(stats.filteredFrequencies);
-                  const maxCount = Math.max(...histogramData.map((b) => b.count), 1);
-                  const barHeight = (bin.count / maxCount) * 100;
-                  return (
+            {isExpanded && (
+              <div style={{ padding: "1rem" }}>
+                <div
+                  style={{
+                    display: "grid",
+                    gridTemplateColumns: "repeat(3, 1fr)",
+                    gap: "1rem",
+                    marginBottom: "1rem",
+                  }}
+                >
+                  <div>
+                    <strong>Messages:</strong> {stats.messageCount}
+                    <br />
+                    <strong>Avg Freq:</strong> {stats.averageFrequency.toFixed(2)} Hz
+                    <br />
+                    <strong>Median Freq:</strong> {stats.medianFrequency.toFixed(2)} Hz
+                  </div>
+                  <div>
+                    <strong>Std Dev:</strong> {stats.stdDeviation.toFixed(2)} Hz
+                    <br />
+                    <strong>Min Freq:</strong> {stats.minFrequency.toFixed(2)} Hz
+                    <br />
+                    <strong>Max Freq:</strong> {stats.maxFrequency.toFixed(2)} Hz
+                  </div>
+                  <div>
+                    <strong>Total Samples:</strong> {stats.frequencies.length}
+                    <br />
+                    <strong>Filtered Samples:</strong> {stats.filteredFrequencies.length}
+                    <br />
+                    <strong>Outliers:</strong> {stats.outlierCount}
+                  </div>
+                </div>
+
+                {showHistogram && stats.filteredFrequencies.length > 0 && (
+                  <div>
+                    <h4>Frequency Distribution (Outliers Removed)</h4>
                     <div
-                      key={index}
                       style={{
-                        flex: 1,
-                        backgroundColor: "#4CAF50",
-                        height: `${barHeight}%`,
-                        minHeight: bin.count > 0 ? "2px" : "0px",
-                        position: "relative",
                         display: "flex",
-                        alignItems: "flex-start",
-                        justifyContent: "center",
+                        alignItems: "end",
+                        height: "120px",
+                        gap: "2px",
+                        position: "relative",
                       }}
-                      title={`${bin.binStart.toFixed(1)}-${bin.binEnd.toFixed(1)} Hz: ${bin.count} samples`}
                     >
-                      {bin.count > 0 && barHeight > 15 && (
-                        <span
-                          style={{
-                            fontSize: "0.7em",
-                            color: "white",
-                            fontWeight: "bold",
-                            textShadow: "1px 1px 1px rgba(0,0,0,0.7)",
-                            paddingTop: "2px",
-                            lineHeight: "1",
-                          }}
-                        >
-                          {bin.count}
-                        </span>
-                      )}
-                      {bin.count > 0 && barHeight <= 15 && (
-                        <span
-                          style={{
-                            fontSize: "0.6em",
-                            color: "#333",
-                            position: "absolute",
-                            top: "-15px",
-                            fontWeight: "bold",
-                          }}
-                        >
-                          {bin.count}
-                        </span>
-                      )}
+                      {createHistogram(stats.filteredFrequencies).map((bin, index) => {
+                        const histogramData = createHistogram(stats.filteredFrequencies);
+                        const maxCount = Math.max(...histogramData.map((b) => b.count), 1);
+                        const barHeight = (bin.count / maxCount) * 100;
+                        return (
+                          <div
+                            key={index}
+                            style={{
+                              flex: 1,
+                              backgroundColor: "#4CAF50",
+                              height: `${barHeight}%`,
+                              minHeight: bin.count > 0 ? "2px" : "0px",
+                              position: "relative",
+                              display: "flex",
+                              alignItems: "flex-start",
+                              justifyContent: "center",
+                            }}
+                            title={`${bin.binStart.toFixed(1)}-${bin.binEnd.toFixed(1)} Hz: ${bin.count} samples`}
+                          >
+                            {bin.count > 0 && barHeight > 15 && (
+                              <span
+                                style={{
+                                  fontSize: "0.7em",
+                                  color: "white",
+                                  fontWeight: "bold",
+                                  textShadow: "1px 1px 1px rgba(0,0,0,0.7)",
+                                  paddingTop: "2px",
+                                  lineHeight: "1",
+                                }}
+                              >
+                                {bin.count}
+                              </span>
+                            )}
+                            {bin.count > 0 && barHeight <= 15 && (
+                              <span
+                                style={{
+                                  fontSize: "0.6em",
+                                  color: "#333",
+                                  position: "absolute",
+                                  top: "-15px",
+                                  fontWeight: "bold",
+                                }}
+                              >
+                                {bin.count}
+                              </span>
+                            )}
+                          </div>
+                        );
+                      })}
                     </div>
-                  );
-                })}
+                    <div style={{ fontSize: "0.8em", marginTop: "0.25rem" }}>
+                      {stats.filteredFrequencies.length > 0 &&
+                        `${Math.min(...stats.filteredFrequencies).toFixed(1)} Hz - ${Math.max(...stats.filteredFrequencies).toFixed(1)} Hz`}
+                    </div>
+                  </div>
+                )}
               </div>
-              <div style={{ fontSize: "0.8em", marginTop: "0.25rem" }}>
-                {stats.filteredFrequencies.length > 0 &&
-                  `${Math.min(...stats.filteredFrequencies).toFixed(1)} Hz - ${Math.max(...stats.filteredFrequencies).toFixed(1)} Hz`}
-              </div>
-            </div>
-          )}
-        </div>
-      ))}
+            )}
+          </div>
+        );
+      })}
     </div>
   );
 }
