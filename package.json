@@ -1,0 +1,35 @@
+{
+  "name": "foxglove-topic-frequency",
+  "displayName": "ROS Topic Frequency Analyzer",
+  "description": "Advanced frequency analysis for ROS topics with outlier detection and histogram visualization",
+  "publisher": "unknown",
+  "homepage": "",
+  "version": "0.0.0",
+  "license": "UNLICENSED",
+  "main": "./dist/extension.js",
+  "keywords": [],
+  "scripts": {
+    "build": "foxglove-extension build",
+    "foxglove:prepublish": "foxglove-extension build --mode production",
+    "lint": "eslint .",
+    "lint:ci": "eslint .",
+    "lint:fix": "eslint --fix .",
+    "local-install": "foxglove-extension install",
+    "package": "foxglove-extension package",
+    "pretest": "foxglove-extension pretest"
+  },
+  "devDependencies": {
+    "@foxglove/eslint-plugin": "2.1.0",
+    "@foxglove/extension": "2.32.1",
+    "@types/react": "18.3.23",
+    "@types/react-dom": "18.3.7",
+    "create-foxglove-extension": "1.0.4",
+    "eslint": "9.31.0",
+    "prettier": "3.6.2",
+    "react": "18.3.1",
+    "react-dom": "18.3.1",
+    "ts-loader": "^9.5.2",
+    "typescript": "5.8.3",
+    "webpack": "^5.100.2"
+  }
+}
